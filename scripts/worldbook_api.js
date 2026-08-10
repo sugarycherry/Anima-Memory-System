@@ -321,13 +321,14 @@ export async function saveSummaryBatchToWorldbook(
     bm25GlobalSettings.bm25_enabled !== false &&
     bm25GlobalSettings.auto_build !== false;
 
-  // 执行拦截：如果向量总开关关闭 或 自动向量化关闭
-  if (!isRagEnabled || !isAutoVectorize) {
+  // 向量和 BM25 是两条独立的同步链路。关闭向量化时只跳过向量，
+  // 不能提前 return，否则会连带跳过已开启的 BM25 自动构建。
+  const shouldAutoVectorize = isRagEnabled && isAutoVectorize;
+  if (!shouldAutoVectorize) {
     console.log(
       `[Anima] 自动向量化已跳过 (总开关: ${isRagEnabled}, 自动: ${isAutoVectorize})`,
     );
     if (window.toastr) toastr.info("总结已保存 (未向量化)");
-    return;
   }
 
   // ✨ 为了给 BM25 提供准确的 entryUid，我们在数据落盘后重新查询一次当前分卷
@@ -338,42 +339,47 @@ export async function saveSummaryBatchToWorldbook(
   );
   const entryUid = savedEntry ? savedEntry.uid : null;
 
-  // 对新生成的每个切片，分别触发向量化和 BM25 索引
+  // 对新生成的每个切片，分别处理向量化和 BM25 索引。
+  // 两条链路相互独立，且等待 BM25 完成后再返回，避免 UI 提前显示“待重构”。
   const successIds = [];
   for (const item of newHistoryItems) {
-    try {
-      // 1. 触发原有的向量写入
-      const result = await insertMemory(
-        summaryList[item.slice_id - 1].content,
-        item.tags,
-        item.narrative_time,
-        targetChatId,
-        null,
-        item.unique_id,
-        batchId,
-      );
+    if (shouldAutoVectorize) {
+      try {
+        const result = await insertMemory(
+          summaryList[item.slice_id - 1].content,
+          item.tags,
+          item.narrative_time,
+          targetChatId,
+          null,
+          item.unique_id,
+          batchId,
+        );
 
-      if (result && result.success === true) {
-        console.log(`[Anima] 向量已存入: ${item.unique_id}`);
-        successIds.push(item.unique_id);
-      } else {
-        console.warn(`[Anima] 向量存入失败: ${item.unique_id}`, result?.error);
+        if (result && result.success === true) {
+          console.log(`[Anima] 向量已存入: ${item.unique_id}`);
+          successIds.push(item.unique_id);
+        } else {
+          console.warn(
+            `[Anima] 向量存入失败: ${item.unique_id}`,
+            result?.error,
+          );
+        }
+      } catch (err) {
+        console.error(`[Anima] 向量存入过程崩溃:`, err);
       }
+    }
 
-      // 2. ✨ 触发新加的 BM25 增量同步 (如果开了自动构建的话)
-      if (isBm25Auto && entryUid) {
-        // 这里不需要 await 阻塞主循环，直接丢进后台运行即可
-        triggerBm25BuildSingle(
+    if (isBm25Auto && entryUid) {
+      try {
+        await triggerBm25BuildSingle(
           item.unique_id,
           entryUid,
           batchId,
           item.tags,
-        ).catch((e) => {
-          console.error(`[Anima BM25] 切片 ${item.unique_id} 自动构建失败:`, e);
-        });
+        );
+      } catch (err) {
+        console.error(`[Anima] BM25 切片 ${item.unique_id} 构建过程崩溃:`, err);
       }
-    } catch (err) {
-      console.error(`[Anima] 存入过程崩溃:`, err);
     }
   }
 
@@ -549,7 +555,9 @@ export async function addSingleSummaryItem(
   // 1. 计算要写入哪个 Chapter
   const chapterNum = Math.ceil(batchId / groupSize);
   const entryName = `chapter_${chapterNum}`;
-  const narrativeTime = Date.now();
+  // 手动补录仍然属于当前聊天文件，必须继承聊天文件的创建时间。
+  // 不能使用 Date.now()，否则历史补录片段会被误判为最新聊天的最新片段。
+  const narrativeTime = await getOrInitNarrativeTime();
 
   const existingEntries = await window.TavernHelper.getWorldbook(wbName);
   let targetEntry = existingEntries.find(
@@ -1290,13 +1298,26 @@ export async function getLatestRecentSummaries(count) {
         const batchId = h.batch_id !== undefined ? h.batch_id : h.index;
         const sliceId = h.slice_id !== undefined ? h.slice_id : 0;
         const uniqueId = h.unique_id !== undefined ? h.unique_id : h.index;
+        const rawNarrativeTime =
+          h.narrative_time !== undefined
+            ? h.narrative_time
+            : entry.extra.narrative_time;
+        const numericNarrativeTime = Number(rawNarrativeTime);
+        const parsedNarrativeTime =
+          Number.isFinite(numericNarrativeTime) && numericNarrativeTime > 0
+            ? numericNarrativeTime
+            : rawNarrativeTime !== undefined && rawNarrativeTime !== null
+              ? new Date(rawNarrativeTime).getTime()
+              : NaN;
 
         allHistory.push({
           batch_id: Number(batchId),
           slice_id: Number(sliceId),
           unique_id: String(uniqueId),
           parentContent: entry.content,
-          narrative_time: h.narrative_time, // 辅助排序
+          narrative_time: Number.isFinite(parsedNarrativeTime)
+            ? parsedNarrativeTime
+            : null,
         });
       });
     }
@@ -1304,29 +1325,28 @@ export async function getLatestRecentSummaries(count) {
 
   if (allHistory.length === 0) return { text: "", ids: [] };
 
-  // 2. 倒序排序 (最新的在最前)
-  // 优先级: NarrativeTime > BatchID > SliceID
-  allHistory.sort((a, b) => {
-    // 如果有时间戳，优先按时间倒序
-    if (
-      a.narrative_time &&
-      b.narrative_time &&
-      a.narrative_time !== b.narrative_time
-    ) {
-      // ✅ 修复：添加 .getTime()
-      return (
-        new Date(b.narrative_time).getTime() -
-        new Date(a.narrative_time).getTime()
-      );
-    }
-    // 其次按 Batch 倒序
+  // 2. 先定位最新聊天记忆库。
+  // narrative_time 表示聊天文件时间；同一个聊天文件中的所有切片应共享它。
+  const narrativeTimes = allHistory
+    .map((item) => item.narrative_time)
+    .filter((time) => Number.isFinite(time));
+  const latestNarrativeTime =
+    narrativeTimes.length > 0 ? Math.max(...narrativeTimes) : null;
+  const latestChatHistory =
+    latestNarrativeTime === null
+      ? allHistory
+      : allHistory.filter(
+          (item) => item.narrative_time === latestNarrativeTime,
+        );
+
+  // 3. 只在最新聊天记忆库内，按 Batch_Slice ID 选择最新切片。
+  latestChatHistory.sort((a, b) => {
     if (a.batch_id !== b.batch_id) return b.batch_id - a.batch_id;
-    // 最后按 Slice 倒序
     return b.slice_id - a.slice_id;
   });
 
-  // 3. 截取前 N 个
-  const selected = allHistory.slice(0, count);
+  // 4. 截取前 N 个
+  const selected = latestChatHistory.slice(0, count);
 
   // 为了符合阅读习惯，虽然是倒序取出来的，但拼接文本时应该按“正序”拼
   // 比如取出 [5_2, 5_1]，拼接时应该是 "内容(5_1)\n\n内容(5_2)"

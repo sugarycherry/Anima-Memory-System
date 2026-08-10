@@ -1180,7 +1180,7 @@ export async function syncStatusToWorldBook(
     keys: ["anima_status", "status_injection"],
     content: finalContent,
     name: "[anima_status]",
-    enabled: true,
+    enabled: settings.status_enabled !== false,
     strategy: { type: "constant" },
     position: {
       type: injectConfig.position || "at_depth",
@@ -1207,6 +1207,48 @@ export async function syncStatusToWorldBook(
   } else {
     await window.TavernHelper.createWorldbookEntries(wbName, [entryData]);
   }
+}
+
+/**
+ * 同步当前聊天世界书中状态注入条目的启用状态。
+ * 只修改已有的 [anima_status]，不创建世界书或条目。
+ */
+export async function syncStatusWorldbookEntryEnabled(isEnabled) {
+  if (!window.TavernHelper) return false;
+
+  const wbName = await safeGetChatWorldbookName();
+  if (!wbName) return false;
+
+  const entries = await window.TavernHelper.getWorldbook(wbName);
+  const targetEntry = entries.find((item) => item.name === "[anima_status]");
+  if (!targetEntry) return false;
+  if (targetEntry.enabled === isEnabled) return true;
+
+  const updatedEntries = await window.TavernHelper.updateWorldbookWith(
+    wbName,
+    (entries) => {
+      const entry = entries.find((item) => item.uid === targetEntry.uid);
+      if (entry) {
+        entry.enabled = isEnabled;
+      }
+      return entries;
+    },
+    { render: "immediate" },
+  );
+
+  const updatedEntry = updatedEntries.find(
+    (item) => item.uid === targetEntry.uid,
+  );
+  if (!updatedEntry || updatedEntry.enabled !== isEnabled) {
+    throw new Error(
+      `世界书 [${wbName}] 的 [anima_status] 条目未能立即切换为 ${isEnabled}`,
+    );
+  }
+
+  console.log(
+    `[Anima Status] 当前聊天 [anima_status] 条目已${isEnabled ? "启用" : "禁用"}`,
+  );
+  return true;
 }
 
 export async function previewStatusPayload() {

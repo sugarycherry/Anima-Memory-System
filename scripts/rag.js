@@ -755,7 +755,7 @@ function renderMainUI(container, settings, ragFiles, currentChatId) {
                             <div class="anima-input-wrapper">
                                  <input type="number" id="rag_inject_recent_count" class="anima-input" 
                                         style="width: 60px; text-align:center;"
-                                        value="${settings.injection_settings?.recent_count || 2}" min="0" max="10">
+                                 value="${settings.injection_settings?.recent_count ?? 2}" min="0" max="10">
                                  <span style="font-size:12px; color:#aaa; margin-left:5px;">条</span>
                             </div>
                         </div>
@@ -1056,7 +1056,10 @@ function bindRagEvents(settings) {
         role: $("#rag_inject_role").val(),
         depth: parseInt($("#rag_inject_depth").val()) || 0,
         order: parseInt($("#rag_inject_order").val()) || 100,
-        recent_count: parseInt($("#rag_inject_recent_count").val()) || 2,
+        recent_count: (() => {
+          const value = parseInt($("#rag_inject_recent_count").val(), 10);
+          return Number.isNaN(value) ? 2 : value;
+        })(),
         template: $("#rag_inject_template").val(),
       };
 

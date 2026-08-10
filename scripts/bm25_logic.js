@@ -56,8 +56,9 @@ export function getBm25BackendConfig(targetDictName = null) {
 
   let activeDictName = targetDictName;
 
-  // 如果没有强制指定词典名，才去读当前角色的兜底配置
+  // 如果没有强制指定词典名，优先读取当前库映射，再回退到角色默认词典。
   if (!activeDictName) {
+    const currentLibName = getCurrentBm25LibName();
     const charId = context.characterId;
     const charSettings =
       charId !== undefined
@@ -65,7 +66,9 @@ export function getBm25BackendConfig(targetDictName = null) {
           {}
         : {};
     activeDictName =
-      charSettings.bound_dict || globalSettings.current_dict || "default_dict";
+      globalSettings.dict_mapping?.[currentLibName]?.dict ||
+      charSettings.bound_dict ||
+      null;
   }
 
   const dictData = globalSettings.custom_dicts?.[activeDictName] || {
@@ -217,11 +220,9 @@ export async function triggerBm25BuildSingle(
       : {};
 
   const dictName =
-    charSettings.bound_dict || globalSettings.current_dict || "default_dict";
-  const dictData = globalSettings.custom_dicts?.[dictName] || {
-    blacklist: "",
-    words: [],
-  };
+    globalSettings.dict_mapping?.[safeChatId]?.dict ||
+    charSettings.bound_dict ||
+    null;
 
   // ✨ 4. 核心精简：抛弃原本那一大坨手工格式化代码
   // 直接调用刚刚修复好的函数，传入当前的词典名生成配置包
@@ -245,6 +246,17 @@ export async function triggerBm25BuildSingle(
     });
 
     if (res.success) {
+      if (dictName && globalSettings.custom_dicts?.[dictName]) {
+        if (!globalSettings.dict_mapping) globalSettings.dict_mapping = {};
+        const existingMapping = globalSettings.dict_mapping[safeChatId];
+        globalSettings.dict_mapping[safeChatId] = {
+          dict: dictName,
+          // 单切片构建成功不代表整库已经完成词典重构。
+          // 保留已有 dirty=true，避免定向重构失败时被错误洗白。
+          dirty: existingMapping?.dirty === true,
+        };
+        context.saveSettingsDebounced();
+      }
       await markBm25Synced(uniqueId);
       return true;
     }
@@ -275,7 +287,9 @@ export async function triggerBm25BuildBatch(dirtyItems) {
       ? context.characters[charId]?.data?.extensions?.anima_bm25_settings || {}
       : {};
   const dictName =
-    charSettings.bound_dict || globalSettings.current_dict || "default_dict";
+    globalSettings.dict_mapping?.[safeChatId]?.dict ||
+    charSettings.bound_dict ||
+    null;
   const bm25Config = getBm25BackendConfig(dictName);
 
   // 将前端格式映射为后端需要的数据包数组
@@ -300,6 +314,16 @@ export async function triggerBm25BuildBatch(dirtyItems) {
     });
 
     if (res.success) {
+      if (dictName && globalSettings.custom_dicts?.[dictName]) {
+        if (!globalSettings.dict_mapping) globalSettings.dict_mapping = {};
+        const existingMapping = globalSettings.dict_mapping[safeChatId];
+        globalSettings.dict_mapping[safeChatId] = {
+          dict: dictName,
+          // 批量切片构建成功不代表整库已经完成词典重构。
+          dirty: existingMapping?.dirty === true,
+        };
+        context.saveSettingsDebounced();
+      }
       // 后端构建成功后，调用我们之前修复过的批量洗白函数，更新世界书状态
       const idsToMark = dirtyItems.map((i) => i.unique_id);
       await markAllBm25SyncedBatch(idsToMark);
@@ -351,6 +375,131 @@ export function getCurrentBm25LibName() {
   return safeChatId.replace(/[^a-zA-Z0-9@\-\._\u4e00-\u9fa5]/g, "_");
 }
 
+async function rebuildAffectedChatLibraries(
+  dictName,
+  oldDictionary,
+  newDictionary,
+  excludedCollectionIds = [],
+) {
+  const context = SillyTavern.getContext();
+  const globalSettings =
+    context.extensionSettings?.anima_memory_system?.bm25 || {};
+  const excludedIds = new Set(excludedCollectionIds.map(String));
+  const collectionIds = Object.entries(globalSettings.dict_mapping || {})
+    .filter(
+      ([libName, mapInfo]) =>
+        !libName.startsWith("kb_") &&
+        mapInfo?.dict === dictName &&
+        !excludedIds.has(String(libName)),
+    )
+    .map(([libName]) => libName);
+
+  if (collectionIds.length === 0) {
+    return { success: true, scanned: 0, matched: 0, rebuilt: 0 };
+  }
+
+  collectionIds.forEach((libName) => {
+    globalSettings.dict_mapping[libName].dirty = true;
+  });
+  context.saveSettingsDebounced();
+
+  try {
+    const result = await $.ajax({
+      url: "/api/plugins/anima-rag/bm25/rebuild_dictionary_affected",
+      type: "POST",
+      contentType: "application/json",
+      data: JSON.stringify({
+        collectionIds,
+        oldDictionary,
+        newDictionary,
+      }),
+      dataType: "json",
+    });
+
+    if (
+      result.success === true &&
+      Array.isArray(result.affectedTerms) &&
+      result.affectedTerms.length === 0
+    ) {
+      collectionIds.forEach((libName) => {
+        if (globalSettings.dict_mapping?.[libName]) {
+          globalSettings.dict_mapping[libName].dirty = false;
+        }
+      });
+    } else {
+      (result.results || []).forEach((libResult) => {
+        const mappingId =
+          libResult.requestedCollectionId || libResult.collectionId;
+        if (
+          libResult.success === true &&
+          globalSettings.dict_mapping?.[mappingId]
+        ) {
+          globalSettings.dict_mapping[mappingId].dirty = false;
+        }
+      });
+    }
+    context.saveSettingsDebounced();
+
+    if (result.success !== true) {
+      console.warn(
+        `[Anima BM25] 词典 [${dictName}] 定向重构部分失败:`,
+        result.results,
+      );
+    } else {
+      console.log(
+        `[Anima BM25] 词典 [${dictName}] 定向扫描完成 | 扫描 ${result.scanned || 0} 条，命中 ${result.matched || 0} 条，重构 ${result.rebuilt || 0} 条`,
+      );
+    }
+
+    return result;
+  } catch (error) {
+    console.error(
+      `[Anima BM25] 词典 [${dictName}] 定向重构请求失败:`,
+      error,
+    );
+    return {
+      success: false,
+      scanned: 0,
+      matched: 0,
+      rebuilt: 0,
+      error: error.message,
+    };
+  }
+}
+
+async function rebuildCurrentChatCollection(dictName) {
+  const context = SillyTavern.getContext();
+  const globalSettings =
+    context.extensionSettings?.anima_memory_system?.bm25 || {};
+  const currentLibName = getCurrentBm25LibName();
+  const bm25Config = getBm25BackendConfig(dictName);
+
+  try {
+    const result = await $.ajax({
+      url: "/api/plugins/anima-rag/bm25/rebuild_collection",
+      type: "POST",
+      contentType: "application/json",
+      data: JSON.stringify({
+        collectionId: currentLibName,
+        bm25Config,
+      }),
+      dataType: "json",
+    });
+
+    if (result.success && globalSettings.dict_mapping?.[currentLibName]) {
+      globalSettings.dict_mapping[currentLibName].dirty = false;
+      context.saveSettingsDebounced();
+    }
+    return result;
+  } catch (error) {
+    console.warn(
+      `[Anima BM25] 当前库 ${currentLibName} 尚无法全量重构:`,
+      error,
+    );
+    return { success: false, error: error.message };
+  }
+}
+
 /**
  * 自动捕获 JSON 数据更新词典 (带全链路 Debug 日志)
  */
@@ -379,18 +528,91 @@ export async function autoUpdateDictionary(dictUpdates) {
 
   // 2. 查角色卡，获取当前绑定的词典
   const charId = context.characterId;
+  if (charId === undefined || charId === null) {
+    console.log("❌ [Debug] 终止: 当前没有可绑定词典的角色");
+    return false;
+  }
+
   const charSettings =
-    charId !== undefined
-      ? context.characters[charId]?.data?.extensions?.anima_bm25_settings || {}
-      : {};
-  const dictName =
-    charSettings.bound_dict || globalSettings.current_dict || "default_dict";
+    context.characters[charId]?.data?.extensions?.anima_bm25_settings || {};
+
+  if (!globalSettings.custom_dicts) globalSettings.custom_dicts = {};
+  if (!globalSettings.dict_mapping) globalSettings.dict_mapping = {};
+
+  const currentLibName = getCurrentBm25LibName();
+  const mappedDictName = globalSettings.dict_mapping[currentLibName]?.dict;
+  const roleDictName = charSettings.bound_dict || null;
+  let dictName =
+    (mappedDictName && globalSettings.custom_dicts[mappedDictName]
+      ? mappedDictName
+      : null) ||
+    (roleDictName && globalSettings.custom_dicts[roleDictName]
+      ? roleDictName
+      : null);
+  let createdForRole = false;
+
+  if (!dictName) {
+    const characterName =
+      String(
+        context.characters[charId]?.name ||
+          context.characters[charId]?.data?.name ||
+          `角色${charId}`,
+      ).trim() || `角色${charId}`;
+    let suffix = 1;
+    let candidateName = `${characterName}-${suffix}`;
+
+    while (globalSettings.custom_dicts[candidateName]) {
+      suffix++;
+      candidateName = `${characterName}-${suffix}`;
+    }
+
+    dictName = candidateName;
+    globalSettings.custom_dicts[dictName] = { words: [] };
+    charSettings.bound_dict = dictName;
+    await context.writeExtensionField(
+      charId,
+      "anima_bm25_settings",
+      charSettings,
+    );
+    globalSettings.current_dict = dictName;
+    createdForRole = true;
+
+    if (typeof $ !== "undefined" && $("#bm25_dict_select").length > 0) {
+      const $dictSelect = $("#bm25_dict_select");
+      const hasOption =
+        $dictSelect
+          .find("option")
+          .filter(function () {
+            return $(this).val() === dictName;
+          }).length > 0;
+      if (!hasOption) {
+        $dictSelect.append(new Option(dictName, dictName));
+      }
+      $dictSelect.val(dictName);
+    }
+
+    if (window.toastr) {
+      toastr.info(
+        `已为当前角色自动创建并绑定词典 [${dictName}]`,
+        "BM25 词典",
+      );
+    }
+  }
+
+  const oldMapping = globalSettings.dict_mapping[currentLibName];
+  const mappingChanged = oldMapping?.dict !== dictName;
+  globalSettings.dict_mapping[currentLibName] = {
+    dict: dictName,
+    dirty:
+      oldMapping?.dirty === true ||
+      (oldMapping !== undefined && mappingChanged),
+  };
+
   console.log(
     `🔍 [Debug] 当前解析出的目标词典名称为: [${dictName}] (当前角色ID: ${charId})`,
   );
 
   // 3. 定位到全局里的具体词典数据
-  if (!globalSettings.custom_dicts) globalSettings.custom_dicts = {};
   const dictData = globalSettings.custom_dicts[dictName];
   if (!dictData) {
     console.log(
@@ -402,6 +624,7 @@ export async function autoUpdateDictionary(dictUpdates) {
 
   // 确保 words 数组存在
   if (!dictData.words) dictData.words = [];
+  const oldDictionary = getBm25BackendConfig(dictName).dictionary || [];
 
   let isChanged = false;
   console.log(
@@ -456,12 +679,34 @@ export async function autoUpdateDictionary(dictUpdates) {
   });
 
   if (isChanged) {
-    console.log("💾 [Debug] 内存数据已修改，正在标脏关联库并固化...");
-
-    // 🟢 接入我们的标脏核心！这让 LLM 修改和点击 UI 按钮的效果完全一致
-    markRelatedLibsDirty(dictName);
+    console.log("💾 [Debug] 内存数据已修改，正在定向同步关联库...");
 
     context.saveSettingsDebounced();
+    const newDictionary = getBm25BackendConfig(dictName).dictionary || [];
+
+    if (globalSettings.auto_build) {
+      if (createdForRole) {
+        if (globalSettings.dict_mapping?.[currentLibName]) {
+          globalSettings.dict_mapping[currentLibName].dirty = true;
+        }
+        await rebuildCurrentChatCollection(dictName);
+      } else {
+        await rebuildAffectedChatLibraries(
+          dictName,
+          oldDictionary,
+          newDictionary,
+        );
+      }
+    } else {
+      Object.entries(globalSettings.dict_mapping || {}).forEach(
+        ([libName, mapInfo]) => {
+          if (!libName.startsWith("kb_") && mapInfo?.dict === dictName) {
+            mapInfo.dirty = true;
+          }
+        },
+      );
+      context.saveSettingsDebounced();
+    }
 
     // ✨✨ 新增：无缝刷新前端 UI 面板 ✨✨
     // 只有当用户确实停留在 BM25 页面，且正在查看的词典就是刚才被更新的词典时，才触发刷新
@@ -484,8 +729,12 @@ export async function autoUpdateDictionary(dictUpdates) {
     return true;
   }
 
+  if (createdForRole || mappingChanged) {
+    context.saveSettingsDebounced();
+  }
+
   console.log("⏸️ [Debug] 遍历完毕，所有词条均已存在，未发生任何实际变更");
-  return false;
+  return createdForRole;
 }
 
 /**
@@ -636,15 +885,14 @@ export async function saveDictionaryAndRebuild(
   if (!globalSettings.custom_dicts) globalSettings.custom_dicts = {};
 
   const oldWords = globalSettings.custom_dicts[dictName]?.words || [];
+  const oldDictionary = getBm25BackendConfig(dictName).dictionary || [];
   const isContentChanged =
     JSON.stringify(oldWords) !== JSON.stringify(cleanWords);
 
   // 1. 覆盖字典数据
   globalSettings.custom_dicts[dictName] = { words: cleanWords };
   globalSettings.current_dict = dictName;
-
-  // 2. 如果内容变了，全员标脏
-  if (isContentChanged) markRelatedLibsDirty(dictName);
+  const newDictionary = getBm25BackendConfig(dictName).dictionary || [];
 
   let isDictSwitched = false;
   const currentLibName = getCurrentBm25LibName();
@@ -663,20 +911,15 @@ export async function saveDictionaryAndRebuild(
       );
 
       if (!globalSettings.dict_mapping) globalSettings.dict_mapping = {};
-      const oldBoundDict = globalSettings.dict_mapping[currentLibName]?.dict;
-      isDictSwitched = oldBoundDict !== dictName;
+      const oldMapping = globalSettings.dict_mapping[currentLibName];
+      isDictSwitched = oldMapping?.dict !== dictName;
 
-      if (isContentChanged || isDictSwitched) {
-        globalSettings.dict_mapping[currentLibName] = {
-          dict: dictName,
-          dirty: true,
-        };
-      } else if (!globalSettings.dict_mapping[currentLibName]) {
-        globalSettings.dict_mapping[currentLibName] = {
-          dict: dictName,
-          dirty: false,
-        };
-      }
+      // 角色词典只作为新库的默认值；应用时仅绑定当前聊天库。
+      globalSettings.dict_mapping[currentLibName] = {
+        dict: dictName,
+        dirty:
+          oldMapping?.dirty === true || isContentChanged || isDictSwitched,
+      };
     } else {
       if (window.toastr) toastr.warning("未选中任何角色！仅保存了词典。");
     }
@@ -687,14 +930,47 @@ export async function saveDictionaryAndRebuild(
 
   // 4. 执行重构
   if (!globalSettings.auto_build) {
+    if (isContentChanged) {
+      Object.entries(globalSettings.dict_mapping || {}).forEach(
+        ([libName, mapInfo]) => {
+          if (!libName.startsWith("kb_") && mapInfo?.dict === dictName) {
+            mapInfo.dirty = true;
+          }
+        },
+      );
+      context.saveSettingsDebounced();
+    }
     return { rebuilt: false, reason: "auto_build_off", isContentChanged };
   }
 
   if (needRebuild) {
-    if (window.toastr)
-      toastr.info("正在后台同步重构相关 BM25 库...", "BM25 引擎");
-    await triggerFullBm25Rebuild(true); // 使用静默模式触发
-    return { rebuilt: true };
+    let targetedResult = null;
+
+    if (isContentChanged) {
+      targetedResult = await rebuildAffectedChatLibraries(
+        dictName,
+        oldDictionary,
+        newDictionary,
+        isDictSwitched ? [currentLibName] : [],
+      );
+    }
+
+    if (isDictSwitched) {
+      if (window.toastr) {
+        toastr.info("正在使用新词典重构当前 BM25 库...", "BM25 引擎");
+      }
+      const fullResult = await rebuildCurrentChatCollection(dictName);
+      return {
+        rebuilt: fullResult.success === true,
+        targetedResult,
+        fullResult,
+      };
+    }
+
+    return {
+      rebuilt: targetedResult?.success === true,
+      targetedResult,
+    };
   }
 
   return { rebuilt: false, reason: "no_change", isContentChanged };
