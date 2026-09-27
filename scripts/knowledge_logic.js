@@ -24,6 +24,10 @@ export async function uploadKnowledgeBase(file, config) {
           settings: {
             delimiter: config.delimiter,
             chunk_size: config.chunk_size,
+            chunk_mode: config.chunk_mode,
+            chapter_patterns: config.chapter_patterns,
+            min_chunk_size: config.min_chunk_size,
+            max_chunk_size: config.max_chunk_size,
           },
           apiConfig: apiConfig,
           vectorConfig: {
@@ -35,7 +39,13 @@ export async function uploadKnowledgeBase(file, config) {
           },
         };
 
-        const response = await callBackend("/import_knowledge", payload);
+        const response = await callBackend("/import_knowledge", {
+          ...payload,
+          contextualConfig: {
+            enabled: config.contextual_enabled === true,
+            chat: (fullConfig.api && fullConfig.api.ctx) || {},
+          },
+        });
 
         resolve(response);
       } catch (err) {

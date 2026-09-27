@@ -25,6 +25,21 @@ export const DEFAULT_KB_SETTINGS = {
     search_top_k: 3, // 向量检索数量
     min_score: 0.5, // 向量最低相关性
     bm25_top_k: 3, // BM25 检索数量
+    rerank_enabled: false, // 结果重排(需重排模型)
+    contextual_enabled: false, // 上下文检索(入库时LLM生成语境)
+    // 🟢 章节感知切片
+    chunk_mode: "auto", // auto | legacy
+    chapter_patterns: [], // 留空则用后端默认正则
+    min_chunk_size: 300,
+    max_chunk_size: 1200,
+    // 🟢 邻接前后文扩展
+    neighbor_enabled: false,
+    neighbor_back: 1,
+    neighbor_forward: 1,
+    // 🟢 章节闸门（防剧透 / 防误召回到未来章节）
+    chapter_gate_enabled: false,
+    chapter_gate_regex: "",
+    current_chapter: 0,
   },
   knowledge_injection: {
     strategy: "constant",
@@ -166,6 +181,20 @@ export async function loadAndRenderKbList() {
     return;
   }
 
+  // 🟢 向量覆盖率：一次取回所有 kb_ 库的向量化进度
+  let vectorStatus = {};
+  try {
+    const statusRes = await $.ajax({
+      url: "/api/plugins/anima-rag/kb_vector_status_all",
+      type: "POST",
+      contentType: "application/json",
+      data: JSON.stringify({}),
+    });
+    vectorStatus = (statusRes && statusRes.results) || {};
+  } catch (e) {
+    vectorStatus = {};
+  }
+
   const html = allUniqueNames
     .map((kbName) => {
       const hasVector = vectorLibs.includes(kbName);
@@ -186,9 +215,26 @@ export async function loadAndRenderKbList() {
           ? mappingData.dirty === true
           : false;
 
+      const coverage = vectorStatus[kbName];
+      const missingCount =
+        coverage && typeof coverage.missingCount === "number"
+          ? coverage.missingCount
+          : 0;
+      const missingHint =
+        coverage && Array.isArray(coverage.missingChunks)
+          ? coverage.missingChunks.slice(0, 12).join(", ")
+          : "";
+      const coverageLabel =
+        coverage && typeof coverage.total === "number"
+          ? `<span style="font-size:11px; color:${missingCount > 0 ? "#f59e0b" : "#6b7280"}; margin-right:6px;" title="已向量化 / 总切片${missingHint ? "；缺失切片: " + missingHint : ""}">${coverage.vectorized}/${coverage.total}</span>`
+          : "";
       const vectorWarning = hasVector
         ? ""
         : `<i class="fa-solid fa-triangle-exclamation" style="color:#f59e0b; font-size:12px; margin-right:5px;" title="向量库缺失"></i>`;
+      const backfillBtn =
+        hasVector && missingCount > 0
+          ? `<button class="anima-btn small btn-backfill-vector" style="background: rgba(245, 158, 11, 0.2); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.4);" data-name="${escapeHtml(kbName)}" data-missing="${missingCount}" title="只补缺失的 ${missingCount} 个切片"><i class="fa-solid fa-wrench"></i></button>`
+          : "";
       const bm25Warning = hasBm25
         ? ""
         : `<i class="fa-solid fa-triangle-exclamation" style="color:#f59e0b; font-size:12px; margin-right:5px;" title="BM25库缺失"></i>`;
@@ -207,7 +253,7 @@ export async function loadAndRenderKbList() {
             </div>
             
             <div class="kb-action-group">
-                ${vectorWarning}
+                ${vectorWarning}${coverageLabel}${backfillBtn}
                 <label class="anima-switch"><input type="checkbox" class="kb-toggle-vector" data-name="${escapeHtml(kbName)}" data-exists="${hasVector}" ${pref.vector_enabled && hasVector ? "checked" : ""}><span class="anima-slider round"></span></label>
                 <button class="anima-btn secondary small btn-rebuild-vector" data-name="${escapeHtml(kbName)}" title="重新向量化"><i class="fa-solid fa-rotate"></i></button>
                 <button class="anima-btn danger small btn-del-vector" data-name="${escapeHtml(kbName)}" title="仅删除向量库"><i class="fa-solid fa-trash"></i></button>
@@ -322,6 +368,42 @@ function renderKnowledgeUI(container, settings, kbList, dictionaries) {
                         <input type="number" id="kb_search_bm25_k" class="anima-input" style="height: 32px; box-sizing: border-box;" value="${settings.knowledge_base.bm25_top_k}" min="1" max="20">
                     </div>
                 </div>
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 12px;">
+                    <div class="anima-flex-row">
+                        <span class="anima-label-text" style="font-size: 13px;">邻接前后文</span>
+                        <label class="anima-switch">
+                            <input type="checkbox" id="kb_search_neighbor" ${settings.knowledge_base.neighbor_enabled ? "checked" : ""}>
+                            <span class="anima-slider round"></span>
+                        </label>
+                    </div>
+                    <div class="anima-compact-input">
+                        <div class="anima-label-text">前 / 后 窗口数</div>
+                        <div style="display:flex; gap:8px;">
+                            <input type="number" id="kb_search_neighbor_back" class="anima-input" style="height:32px; box-sizing:border-box;" value="${settings.knowledge_base.neighbor_back}" min="0" max="10">
+                            <input type="number" id="kb_search_neighbor_forward" class="anima-input" style="height:32px; box-sizing:border-box;" value="${settings.knowledge_base.neighbor_forward}" min="0" max="10">
+                        </div>
+                    </div>
+                </div>
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 12px;">
+                    <div class="anima-flex-row">
+                        <span class="anima-label-text" style="font-size: 13px;">章节闸门 (防剧透)</span>
+                        <label class="anima-switch">
+                            <input type="checkbox" id="kb_search_chapter_gate" ${settings.knowledge_base.chapter_gate_enabled ? "checked" : ""}>
+                            <span class="anima-slider round"></span>
+                        </label>
+                    </div>
+                    <div class="anima-compact-input">
+                        <div class="anima-label-text">当前章节 (0 = 不限制)</div>
+                        <input type="number" id="kb_search_current_chapter" class="anima-input" style="height:32px; box-sizing:border-box;" value="${settings.knowledge_base.current_chapter}" min="0">
+                    </div>
+                </div>
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+                    <span class="anima-label-text" style="font-size: 13px;">结果重排 (需配置重排模型)</span>
+                    <label class="anima-switch">
+                        <input type="checkbox" id="kb_search_rerank" ${settings.knowledge_base.rerank_enabled ? "checked" : ""}>
+                        <span class="anima-slider round"></span>
+                    </label>
+                </div>
                 <div>
                     <button id="btn_kb_save_search" class="anima-btn secondary" style="width:100%">
                         <i class="fa-solid fa-floppy-disk"></i> 保存检索配置
@@ -385,6 +467,36 @@ function renderKnowledgeUI(container, settings, kbList, dictionaries) {
                     </div>
                 </div>
 
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 15px;">
+                    <div class="anima-compact-input">
+                        <div class="anima-label-small">切片模式</div>
+                        <select id="kb_build_chunk_mode" class="anima-select" style="height:32px; box-sizing:border-box; padding:0 10px; line-height:30px;">
+                            <option value="auto" ${settings.knowledge_base.chunk_mode === "legacy" ? "" : "selected"}>自动 (按章节优先)</option>
+                            <option value="legacy" ${settings.knowledge_base.chunk_mode === "legacy" ? "selected" : ""}>旧版 (纯字数/分隔符)</option>
+                        </select>
+                    </div>
+                    <div class="anima-compact-input">
+                        <div class="anima-label-small">分片字数 上限 / 下限</div>
+                        <div style="display:flex; gap:8px;">
+                            <input type="number" id="kb_build_max_chunk" class="anima-input" style="height:32px; box-sizing:border-box;" value="${settings.knowledge_base.max_chunk_size}" min="100" step="50">
+                            <input type="number" id="kb_build_min_chunk" class="anima-input" style="height:32px; box-sizing:border-box;" value="${settings.knowledge_base.min_chunk_size}" min="50" step="50">
+                        </div>
+                    </div>
+                </div>
+                <div class="anima-compact-input" style="margin-bottom: 15px;">
+                    <div class="anima-label-small">章标题正则 (每行一条，留空用后端默认)</div>
+                    <textarea id="kb_build_chapter_patterns" class="anima-textarea" style="width:100%; height:52px;" placeholder="例如: ^第[0-9零一二三四五六七八九十百千万两]+章">${escapeHtml((settings.knowledge_base.chapter_patterns || []).join("\n"))}</textarea>
+                </div>
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+                    <div>
+                        <span class="anima-label-text" style="font-size: 13px;">上下文检索 (建库时用 🧩上下文检索模型 给每片生成语境)</span>
+                        <div class="anima-desc-inline">只影响建库：每片多一次 LLM 调用（约 3~4 秒/片）；语境仅用于建索引，注入给你的仍是纯原文。实测收益视语料而定，不保证提升</div>
+                    </div>
+                    <label class="anima-switch">
+                        <input type="checkbox" id="kb_build_contextual" ${settings.knowledge_base.contextual_enabled ? "checked" : ""}>
+                        <span class="anima-slider round"></span>
+                    </label>
+                </div>
                 <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 15px;">
                     <div class="anima-flex-row">
                         <span class="anima-label-text" style="font-size: 13px;">写入向量库</span>
@@ -674,6 +786,18 @@ function bindKnowledgeEvents(dictionaries) {
       settings.knowledge_base.chunk_size =
         parseInt($("#kb_build_chunk_size").val()) || 500;
       settings.knowledge_base.dictionary = $("#kb_build_dict_select").val(); // 顺便保存默认选中的词典
+      settings.knowledge_base.chunk_mode =
+        $("#kb_build_chunk_mode").val() || "auto";
+      settings.knowledge_base.min_chunk_size =
+        parseInt($("#kb_build_min_chunk").val()) || 300;
+      settings.knowledge_base.max_chunk_size =
+        parseInt($("#kb_build_max_chunk").val()) || 1200;
+      settings.knowledge_base.chapter_patterns = (
+        $("#kb_build_chapter_patterns").val() || ""
+      )
+        .split("\n")
+        .map((s) => s.trim())
+        .filter(Boolean);
 
       saveGlobalSettings();
       toastr.success("知识库构建配置已保存至全局");
@@ -708,6 +832,20 @@ function bindKnowledgeEvents(dictionaries) {
       const writeVector = $("#kb_build_write_vector").prop("checked");
       const writeBm25 = $("#kb_build_write_bm25").prop("checked");
       const dictName = $("#kb_build_dict_select").val();
+      const chunkMode = $("#kb_build_chunk_mode").val() || "auto";
+      const minChunkSize =
+        parseInt($("#kb_build_min_chunk").val()) || 300;
+      const maxChunkSize =
+        parseInt($("#kb_build_max_chunk").val()) || 1200;
+      const chapterPatterns = (
+        $("#kb_build_chapter_patterns").val() || ""
+      )
+        .split("\n")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const contextualEnabled = $(
+        "#kb_build_contextual",
+      ).prop("checked");
 
       if (!writeVector && !writeBm25) {
         return toastr.warning("向量库和 BM25 至少需要选择写入一项！");
@@ -726,14 +864,39 @@ function bindKnowledgeEvents(dictionaries) {
       try {
         // 3. 遍历打包配置并上传
         for (const file of selectedFiles) {
-          await uploadKnowledgeBase(file, {
+          const uploadRes = await uploadKnowledgeBase(file, {
             delimiter,
             chunk_size: chunkSize,
             write_vector: writeVector,
             write_bm25: writeBm25,
             dictName: dictName,
             dictContent: dictContent,
+            chunk_mode: chunkMode,
+            chapter_patterns: chapterPatterns,
+            min_chunk_size: minChunkSize,
+            max_chunk_size: maxChunkSize,
+            contextual_enabled: contextualEnabled,
           });
+
+          if (
+            uploadRes &&
+            Array.isArray(uploadRes.failed) &&
+            uploadRes.failed.length > 0
+          ) {
+            toastr.warning(
+              `⚠️ ${file.name}: ${uploadRes.failed.length}/${uploadRes.total} 个切片向量化失败，可在知识库管理里点【补全缺失】修复。`,
+              "向量化未完成",
+              { timeOut: 8000 },
+            );
+          }
+
+          if (uploadRes && uploadRes.contextual) {
+            toastr.info(
+              `${file.name}: 语境生成 ${uploadRes.contextual.generated} 成功 / ${uploadRes.contextual.failed} 失败。`,
+              "上下文检索",
+              { timeOut: 6000 },
+            );
+          }
 
           // 🌟 4. 构建成功后，如果开启了 BM25，立刻将该知识库与选择的词典绑定到全局
           if (writeBm25) {
@@ -821,6 +984,23 @@ function bindKnowledgeEvents(dictionaries) {
 
       const bm25K = parseInt($("#kb_search_bm25_k").val());
       settings.knowledge_base.bm25_top_k = !isNaN(bm25K) ? bm25K : 3;
+
+      settings.knowledge_base.neighbor_enabled =
+        $("#kb_search_neighbor").prop("checked");
+      settings.knowledge_base.neighbor_back =
+        parseInt($("#kb_search_neighbor_back").val()) || 0;
+      settings.knowledge_base.neighbor_forward =
+        parseInt($("#kb_search_neighbor_forward").val()) || 0;
+
+      settings.knowledge_base.chapter_gate_enabled =
+        $("#kb_search_chapter_gate").prop("checked");
+      settings.knowledge_base.current_chapter =
+        parseInt($("#kb_search_current_chapter").val()) || 0;
+      settings.knowledge_base.chapter_gate_regex =
+        settings.knowledge_base.chapter_gate_regex || "";
+      settings.knowledge_base.rerank_enabled = $(
+        "#kb_search_rerank",
+      ).prop("checked");
 
       saveGlobalSettings();
       toastr.success("知识库检索配置已保存");
@@ -1282,6 +1462,58 @@ function bindKnowledgeEvents(dictionaries) {
       } catch (e) {
         toastr.error("洗盘失败: " + (e.responseJSON?.message || e.message));
       }
+    }
+  });
+
+  // === 绑定 2.5：只补缺失向量 ===
+  $container.on("click", ".btn-backfill-vector", async function () {
+    const kbName = $(this).data("name");
+    const missing = $(this).data("missing") || 0;
+    const fullConfig =
+      typeof getAnimaConfig === "function" ? getAnimaConfig() : {};
+    const apiConfig = fullConfig.api?.rag || {};
+
+    if (!apiConfig || !apiConfig.key) {
+      return toastr.warning(
+        "缺失向量模型 API Key，请先在 API 设置里配置 RAG 模型。",
+      );
+    }
+    if (
+      !confirm(
+        `将为 [${kbName}] 补全 ${missing} 个缺失向量。\n（只处理缺失切片，已成功的不受影响，可重复点击）`,
+      )
+    )
+      return;
+
+    const $btn = $(this);
+    $btn
+      .prop("disabled", true)
+      .html(`<i class="fa-solid fa-spinner fa-spin"></i>`);
+    try {
+      const res = await $.ajax({
+        url: "/api/plugins/anima-rag/kb_vectorize_missing",
+        type: "POST",
+        contentType: "application/json",
+        data: JSON.stringify({ collectionId: kbName, apiConfig: apiConfig }),
+      });
+      if (res.success) {
+        if (res.failed && res.failed.length > 0) {
+          toastr.warning(
+            `补全完成：成功 ${res.vectorized} 个，失败 ${res.failed.length} 个（可稍后再点）。`,
+          );
+        } else {
+          toastr.success(`补全完成：成功 ${res.vectorized} 个。`);
+        }
+      } else {
+        toastr.error(res.message || "补全失败");
+      }
+    } catch (e) {
+      toastr.error("补全失败: " + (e.responseJSON?.message || e.message));
+    } finally {
+      $btn
+        .prop("disabled", false)
+        .html(`<i class="fa-solid fa-wrench"></i>`);
+      loadAndRenderKbList();
     }
   });
 

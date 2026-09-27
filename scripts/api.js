@@ -42,6 +42,15 @@ const defaultSettings = {
       timeout: 15,
       current_channel: "默认渠道",
     },
+    ctx: {
+      source: "openai",
+      url: "",
+      key: "",
+      model: "",
+      temperature: 0.3,
+      max_output: 1024,
+      current_channel: "默认渠道",
+    },
   },
   // 🟢 新增：渠道预设仓库
   api_profiles: {
@@ -49,6 +58,7 @@ const defaultSettings = {
     status: { 默认渠道: {} },
     rag: { 默认渠道: {} },
     rerank: { 默认渠道: {} },
+    ctx: { 默认渠道: {} },
   },
 };
 
@@ -679,6 +689,7 @@ export function initApiSettings() {
         ${getApiCardHtml("status", "📊 状态模型")}
         ${getApiCardHtml("rag", "📚 向量模型")}
         ${getApiCardHtml("rerank", "⚖️ 重排模型")}
+        ${getApiCardHtml("ctx", "🧩 上下文检索模型")}
         ${modalHtml} 
     `;
 
@@ -689,6 +700,7 @@ export function initApiSettings() {
   bindLogic("status");
   bindLogic("rag");
   bindLogic("rerank");
+  bindLogic("ctx");
 
   // 初始化弹窗逻辑
   initModalLogic();
@@ -864,6 +876,14 @@ function saveSettingsFromUI() {
       top_k: extensionSettings[MODULE_NAME]?.api?.rag?.top_k ?? 5,
       threshold: extensionSettings[MODULE_NAME]?.api?.rag?.threshold ?? 0.4,
     },
+    ctx: {
+      source: getVal("anima-ctx-source"),
+      url: getVal("anima-ctx-url"),
+      key: getVal("anima-ctx-key"),
+      model: getVal("anima-ctx-model"),
+      temperature: 0.3,
+      max_output: 1024,
+    },
     rerank: {
       url: getVal("anima-rerank-url"),
       key: getVal("anima-rerank-key"),
@@ -881,7 +901,7 @@ function saveSettingsFromUI() {
   }
 
   // 2. 🟢 核心逻辑：遍历四个模块，保存到预设仓库，并更新当前激活配置
-  const types = ["llm", "status", "rag", "rerank"];
+  const types = ["llm", "status", "rag", "rerank", "ctx"];
   types.forEach((type) => {
     // 获取当前下拉框选中的渠道名，如果没有渲染出来则默认使用 "默认渠道"
     const channelName = getVal(`anima-${type}-channel`) || "默认渠道";
@@ -948,6 +968,7 @@ function loadSettingsToUI() {
   renderChannels("status");
   renderChannels("rag");
   renderChannels("rerank");
+  renderChannels("ctx");
 
   // LLM 加载
   if (config.llm) {
@@ -977,6 +998,12 @@ function loadSettingsToUI() {
     setVal("anima-rag-url", config.rag.url);
     setVal("anima-rag-key", config.rag.key);
     setModel("rag", config.rag.model);
+  }
+  if (config.ctx) {
+    setVal("anima-ctx-source", config.ctx.source);
+    setVal("anima-ctx-url", config.ctx.url);
+    setVal("anima-ctx-key", config.ctx.key);
+    setModel("ctx", config.ctx.model);
   }
   if (config.rerank) {
     setVal("anima-rerank-url", config.rerank.url);
