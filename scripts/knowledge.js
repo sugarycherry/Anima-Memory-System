@@ -256,7 +256,7 @@ export async function loadAndRenderKbList() {
                 ${vectorWarning}${coverageLabel}${backfillBtn}
                 <label class="anima-switch"><input type="checkbox" class="kb-toggle-vector" data-name="${escapeHtml(kbName)}" data-exists="${hasVector}" ${pref.vector_enabled && hasVector ? "checked" : ""}><span class="anima-slider round"></span></label>
                 <button class="anima-btn secondary small btn-rebuild-vector" data-name="${escapeHtml(kbName)}" title="重新向量化"><i class="fa-solid fa-rotate"></i></button>
-                <button class="anima-btn danger small btn-del-vector" data-name="${escapeHtml(kbName)}" title="仅删除向量库"><i class="fa-solid fa-trash"></i></button>
+                <button class="anima-btn danger small btn-del-vector" data-name="${escapeHtml(kbName)}" title="删除整本书（向量库 + BM25）"><i class="fa-solid fa-trash"></i></button>
             </div>
 
             <div class="kb-action-group">
@@ -1542,16 +1542,16 @@ function bindKnowledgeEvents(dictionaries) {
 
   $container.on("click", ".btn-del-vector", async function () {
     const kbName = $(this).data("name");
-    // 🌟 修改了提示语，明确告知只删向量库
+    // 🌟 删除整本书：向量库 + BM25 库 一起删
     if (
       !confirm(
-        `确定要彻底删除 [${kbName}] 的向量库数据吗？\n(此操作不会影响已存在的 BM25 库，但失去原文对照后将无法再重建 BM25)`,
+        `确定要彻底删除 [${kbName}] 整本书吗？\n（向量库 + BM25 库都会被删除，不可恢复）`,
       )
     )
       return;
     try {
       await $.ajax({
-        url: "/api/plugins/anima-rag/delete_collection",
+        url: "/api/plugins/anima-rag/delete_book",
         type: "POST",
         contentType: "application/json",
         data: JSON.stringify({ collectionId: kbName }),
@@ -1562,7 +1562,7 @@ function bindKnowledgeEvents(dictionaries) {
       delete kbSettings.dict_mapping[kbName];
       saveGlobalSettings();
 
-      toastr.success("向量库已彻底销毁");
+      toastr.success("整本书已删除（向量库 + BM25）");
       loadAndRenderKbList();
     } catch (e) {
       toastr.error("删除失败");
