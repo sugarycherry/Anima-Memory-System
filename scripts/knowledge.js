@@ -353,7 +353,7 @@ function renderKnowledgeUI(container, settings, kbList, dictionaries) {
             <div class="anima-card">
                 <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 10px;">
                     <div class="anima-compact-input">
-                        <div class="anima-label-text">向量检索数量 (Top K)</div>
+                        <div class="anima-label-text">向量检索数量 (Top K，仅候选池)</div>
                         <input type="number" id="kb_search_vector_k" class="anima-input" style="height: 32px; box-sizing: border-box;" value="${settings.knowledge_base.search_top_k}" min="1" max="20">
                     </div>
                     <div class="anima-compact-input">
@@ -370,14 +370,14 @@ function renderKnowledgeUI(container, settings, kbList, dictionaries) {
                 </div>
                 <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 12px;">
                     <div class="anima-flex-row">
-                        <span class="anima-label-text" style="font-size: 13px;">邻接前后文</span>
+                        <span class="anima-label-text" style="font-size: 13px;">邻接前后文（KB 已强制开启）</span>
                         <label class="anima-switch">
                             <input type="checkbox" id="kb_search_neighbor" ${settings.knowledge_base.neighbor_enabled ? "checked" : ""}>
                             <span class="anima-slider round"></span>
                         </label>
                     </div>
                     <div class="anima-compact-input">
-                        <div class="anima-label-text">前 / 后 窗口数</div>
+                        <div class="anima-label-text">前 / 后 窗口数（返回条数 = 1+前+后）</div>
                         <div style="display:flex; gap:8px;">
                             <input type="number" id="kb_search_neighbor_back" class="anima-input" style="height:32px; box-sizing:border-box;" value="${settings.knowledge_base.neighbor_back}" min="0" max="10">
                             <input type="number" id="kb_search_neighbor_forward" class="anima-input" style="height:32px; box-sizing:border-box;" value="${settings.knowledge_base.neighbor_forward}" min="0" max="10">
